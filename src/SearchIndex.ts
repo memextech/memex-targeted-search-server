@@ -72,7 +72,7 @@ export class SearchIndex {
 
       this.db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
-          title, summary, project, content=conversations, content_rowid=rowid
+          conversation_id, title, summary, project
         )
       `);
 
@@ -91,7 +91,7 @@ export class SearchIndex {
 
       this.db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-          content, content=messages, content_rowid=rowid
+          conversation_id, content
         )
       `);
 
@@ -111,7 +111,7 @@ export class SearchIndex {
 
       this.db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS commands_fts USING fts5(
-          command, context, content=commands, content_rowid=rowid
+          conversation_id, command, context
         )
       `);
 
@@ -127,6 +127,9 @@ export class SearchIndex {
     console.error("Building search index...");
     
     try {
+      // Clear existing data
+      await this.clearIndex();
+      
       const files = await fs.promises.readdir(historyPath);
       const jsonFiles = files.filter(f => f.endsWith('.json'));
       
@@ -151,6 +154,22 @@ export class SearchIndex {
       console.error(`Failed to build index: ${error}`);
       throw error;
     }
+  }
+
+  private async clearIndex(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.db.serialize(() => {
+        this.db.run("DELETE FROM conversations");
+        this.db.run("DELETE FROM conversations_fts");
+        this.db.run("DELETE FROM messages");
+        this.db.run("DELETE FROM messages_fts");
+        this.db.run("DELETE FROM commands");
+        this.db.run("DELETE FROM commands_fts", (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    });
   }
 
   private async processBatch(files: string[], historyPath: string): Promise<void> {
@@ -236,11 +255,12 @@ export class SearchIndex {
     const lines = content.split('\n');
 
     // Extract backtick commands
-    const backtickMatches = content.match(/`([^`]+)`/g);
+    const backtickMatches = content.match(/`([^`\n]+)`/g);
     if (backtickMatches) {
       for (const match of backtickMatches) {
-        const command = match.slice(1, -1);
-        if (this.looksLikeCommand(command)) {
+        const command = match.slice(1, -1).trim();
+        // More strict filtering for backticks
+        if (command.length > 3 && command.length < 150 && this.looksLikeCommand(command)) {
           commands.push({
             id: `cmd_${conversationId}_${messageIndex}_${commands.length}`,
             conversation_id: conversationId,
@@ -248,7 +268,7 @@ export class SearchIndex {
             command: command,
             command_type: this.classifyCommand(command),
             context: this.getCommandContext(lines, command),
-            confidence: 0.8
+            confidence: 0.9
           });
         }
       }
@@ -275,13 +295,26 @@ export class SearchIndex {
   }
 
   private looksLikeCommand(text: string): boolean {
+    const trimmed = text.trim();
+    
+    // Must be reasonably short to be a command
+    if (trimmed.length > 200 || trimmed.length < 3) return false;
+    
+    // Should not contain certain characters that indicate it's not a command
+    if (trimmed.includes('{') || trimmed.includes('}') || trimmed.includes('(') || trimmed.includes(')')) {
+      // Exception: allow simple parameter syntax like command --flag=value
+      if (!trimmed.match(/^[\w\s\-=\.\/]+$/)) return false;
+    }
+    
     const commandIndicators = [
-      /^(npm|yarn|pnpm|git|python|node|docker|curl|wget|cd|ls|mkdir|cp|mv|rm|firebase|memex)\s/i,
+      /^(npm|yarn|pnpm|git|python|py|node|tsx|docker|curl|wget|cd|ls|mkdir|cp|mv|rm|firebase|memex)\s/i,
       /^\w+\s+--?\w+/,
-      /\.\w+$/,
-      /^[a-zA-Z0-9_-]+\s+[a-zA-Z0-9_-]+/
+      /^\$\s+/,
+      /^sudo\s+/i,
+      /\.sh$|\.py$|\.js$|\.ts$/,
+      /^[a-zA-Z0-9_-]+\s+(install|build|start|deploy|login|init|create|run|test)\b/i
     ];
-    return commandIndicators.some(pattern => pattern.test(text.trim()));
+    return commandIndicators.some(pattern => pattern.test(trimmed));
   }
 
   private classifyCommand(command: string): 'cli' | 'code' | 'config' {
@@ -332,14 +365,27 @@ export class SearchIndex {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `);
 
+        const ftsStmt = this.db.prepare(`
+          INSERT OR REPLACE INTO conversations_fts 
+          (conversation_id, title, summary, project)
+          VALUES (?, ?, ?, ?)
+        `);
+
         for (const conv of conversations) {
           stmt.run(conv.id, conv.conversation_id, conv.title, conv.summary, 
                   conv.created_at, conv.project, conv.file_path, conv.message_count);
+          ftsStmt.run(conv.conversation_id, conv.title, conv.summary, conv.project || '');
         }
 
-        stmt.finalize((err) => {
-          if (err) reject(err);
-          else resolve();
+        stmt.finalize((err1) => {
+          if (err1) {
+            reject(err1);
+            return;
+          }
+          ftsStmt.finalize((err2) => {
+            if (err2) reject(err2);
+            else resolve();
+          });
         });
       });
     });
@@ -354,14 +400,30 @@ export class SearchIndex {
           VALUES (?, ?, ?, ?, ?, ?)
         `);
 
+        const ftsStmt = this.db.prepare(`
+          INSERT OR REPLACE INTO messages_fts 
+          (conversation_id, content)
+          VALUES (?, ?)
+        `);
+
         for (const msg of messages) {
           stmt.run(msg.id, msg.conversation_id, msg.message_index, 
                   msg.role, msg.content, msg.content_type);
+          // Only index substantial content for FTS
+          if (msg.content && msg.content.length > 10) {
+            ftsStmt.run(msg.conversation_id, msg.content);
+          }
         }
 
-        stmt.finalize((err) => {
-          if (err) reject(err);
-          else resolve();
+        stmt.finalize((err1) => {
+          if (err1) {
+            reject(err1);
+            return;
+          }
+          ftsStmt.finalize((err2) => {
+            if (err2) reject(err2);
+            else resolve();
+          });
         });
       });
     });
@@ -376,14 +438,27 @@ export class SearchIndex {
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `);
 
+        const ftsStmt = this.db.prepare(`
+          INSERT OR REPLACE INTO commands_fts 
+          (conversation_id, command, context)
+          VALUES (?, ?, ?)
+        `);
+
         for (const cmd of commands) {
           stmt.run(cmd.id, cmd.conversation_id, cmd.message_index, 
                   cmd.command, cmd.command_type, cmd.context, cmd.confidence);
+          ftsStmt.run(cmd.conversation_id, cmd.command, cmd.context);
         }
 
-        stmt.finalize((err) => {
-          if (err) reject(err);
-          else resolve();
+        stmt.finalize((err1) => {
+          if (err1) {
+            reject(err1);
+            return;
+          }
+          ftsStmt.finalize((err2) => {
+            if (err2) reject(err2);
+            else resolve();
+          });
         });
       });
     });
@@ -463,7 +538,7 @@ export class SearchIndex {
     let sql = `
       SELECT c.*, bm25(conversations_fts) as rank
       FROM conversations c
-      JOIN conversations_fts ON conversations_fts.rowid = c.rowid
+      JOIN conversations_fts ON conversations_fts.conversation_id = c.conversation_id
       WHERE conversations_fts MATCH ?
     `;
     
@@ -494,7 +569,7 @@ export class SearchIndex {
           const results: SearchResult[] = (rows as any[]).map(row => ({
             type: 'conversation' as const,
             item: row as IndexedConversation,
-            score: row.rank
+            score: row.rank || 0
           }));
           resolve(results);
         }
@@ -515,7 +590,7 @@ export class SearchIndex {
     let sql = `
       SELECT c.*, bm25(commands_fts) as rank
       FROM commands c
-      JOIN commands_fts ON commands_fts.rowid = c.rowid
+      JOIN commands_fts ON commands_fts.conversation_id = c.conversation_id
       WHERE commands_fts MATCH ?
     `;
     
@@ -536,7 +611,7 @@ export class SearchIndex {
           const results: SearchResult[] = (rows as any[]).map(row => ({
             type: 'command' as const,
             item: row as IndexedCommand,
-            score: row.rank
+            score: row.rank || 0
           }));
           resolve(results);
         }
