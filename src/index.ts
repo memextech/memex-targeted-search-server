@@ -81,18 +81,24 @@ class MemexSearchServer {
         tools: [
           {
             name: "search_conversations",
-            description: "Search through Memex conversation history by text content, title, or metadata",
+            description: "Search through Memex conversation history and projects for commands, CLI usage, code snippets, and content",
             inputSchema: {
               type: "object",
               properties: {
                 query: {
                   type: "string",
-                  description: "Search query to match against conversation content, title, or summary"
+                  description: "Search for specific commands (e.g. 'memex agent cli', 'npm install', 'git commit') or general content"
+                },
+                command_type: {
+                  type: "string",
+                  enum: ["cli", "code", "config", "any"],
+                  description: "Type of command to search for (default: any)",
+                  default: "any"
                 },
                 limit: {
                   type: "number",
-                  description: "Maximum number of results to return (default: 10)",
-                  default: 10
+                  description: "Maximum number of results to return (default: 5)",
+                  default: 5
                 },
                 project: {
                   type: "string",
@@ -172,31 +178,7 @@ class MemexSearchServer {
               required: ["project_name"]
             }
           },
-          {
-            name: "find_command",
-            description: "Find specific commands, CLI usage, or code snippets from conversation history",
-            inputSchema: {
-              type: "object",
-              properties: {
-                query: {
-                  type: "string",
-                  description: "Search for specific commands (e.g. 'memex agent cli', 'npm install', 'git commit')"
-                },
-                command_type: {
-                  type: "string",
-                  enum: ["cli", "code", "config", "any"],
-                  description: "Type of command to search for (default: any)",
-                  default: "any"
-                },
-                limit: {
-                  type: "number",
-                  description: "Maximum number of results to return (default: 5)",
-                  default: 5
-                }
-              },
-              required: ["query"]
-            }
-          },
+
           {
             name: "build_search_index",
             description: "Build or rebuild the search index for better performance",
@@ -233,8 +215,6 @@ class MemexSearchServer {
             return await this.searchProjects(args);
           case "get_project_overview":
             return await this.getProjectOverview(args);
-          case "find_command":
-            return await this.findCommand(args);
           case "build_search_index":
             return await this.buildSearchIndex(args);
           case "get_search_stats":
@@ -256,48 +236,89 @@ class MemexSearchServer {
   }
 
   private async searchConversations(args: any) {
-    const { query, limit = 10, project, date_from, date_to } = args;
+    const { query, command_type = "any", limit = 5, project, date_from, date_to } = args;
     
     try {
-      // Try to use indexed search first
+      // Use the working indexed search for commands and content
       try {
-        const results = await this.searchIndex.searchConversations(query, {
+        // First try command search (what was working well)
+        const commandResults = await this.searchIndex.searchCommands(query, {
+          commandType: command_type,
+          limit: Math.ceil(limit / 2)
+        });
+
+        // Also try conversation search for titles/summaries
+        const conversationResults = await this.searchIndex.searchConversations(query, {
           project,
           dateFrom: date_from,
           dateTo: date_to,
-          limit
+          limit: Math.ceil(limit / 2)
         });
+
+        // Combine and deduplicate results
+        const combinedResults = [];
+        
+        // Add command results
+        for (const r of commandResults) {
+          const item = r.item as any;
+          combinedResults.push({
+            type: "command",
+            conversation_id: item.conversation_id,
+            title: `Command: ${item.command}`,
+            summary: item.context,
+            command: item.command,
+            command_type: item.command_type,
+            message_index: item.message_index,
+            confidence: item.confidence,
+            search_score: r.score,
+            relevance: `command (score: ${r.score.toFixed(2)})`
+          });
+        }
+
+        // Add conversation results
+        for (const r of conversationResults) {
+          const item = r.item as any;
+          // Check if we already have this conversation
+          const existing = combinedResults.find(cr => cr.conversation_id === item.conversation_id);
+          if (!existing) {
+            combinedResults.push({
+              type: "conversation",
+              conversation_id: item.conversation_id,
+              title: item.title,
+              summary: item.summary,
+              created_at: item.created_at,
+              project: item.project,
+              message_count: item.message_count,
+              search_score: r.score,
+              relevance: `conversation (score: ${r.score.toFixed(2)})`,
+              file: item.file_path
+            });
+          }
+        }
+
+        // Sort by relevance score and take top results
+        combinedResults.sort((a, b) => a.search_score - b.search_score); // Lower scores are better for FTS
+        const finalResults = combinedResults.slice(0, limit);
 
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
-                total_found: results.length,
-                search_method: "indexed",
-                conversations: results.map(r => {
-                  const item = r.item as any; // Type assertion for now
-                  return {
-                    conversation_id: item.conversation_id,
-                    title: item.title,
-                    summary: item.summary,
-                    created_at: item.created_at,
-                    project: item.project,
-                    message_count: item.message_count,
-                    relevance: `indexed search (score: ${r.score.toFixed(2)})`,
-                    file: item.file_path
-                  };
-                })
+                query,
+                total_found: finalResults.length,
+                search_method: "unified_indexed",
+                results: finalResults
               }, null, 2)
             }
           ]
         };
       } catch (indexError) {
-        // Fall back to original search method
-        return await this.fallbackSearchConversations(args);
+        // Fall back to simple search if index fails
+        return await this.fallbackFindCommand(args);
       }
     } catch (error) {
-      throw new Error(`Failed to search conversations: ${error}`);
+      throw new Error(`Failed to search: ${error}`);
     }
   }
 
@@ -617,51 +638,6 @@ class MemexSearchServer {
     return analysis;
   }
 
-  private async findCommand(args: any) {
-    const { query, command_type = "any", limit = 5 } = args;
-    
-    try {
-      // Try indexed search first
-      try {
-        const results = await this.searchIndex.searchCommands(query, {
-          commandType: command_type,
-          limit
-        });
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                query,
-                total_found: results.length,
-                search_method: "indexed",
-                commands: results.map(r => {
-                  const item = r.item as any; // Type assertion for now
-                  return {
-                    command: item.command,
-                    context: item.context,
-                    conversation_id: item.conversation_id,
-                    conversation_title: `Message ${item.message_index}`,
-                    message_index: item.message_index,
-                    confidence: item.confidence,
-                    type: item.command_type,
-                    search_score: r.score
-                  };
-                })
-              }, null, 2)
-            }
-          ]
-        };
-      } catch (indexError) {
-        // Fall back to original method
-        return await this.fallbackFindCommand(args);
-      }
-    } catch (error) {
-      throw new Error(`Failed to find commands: ${error}`);
-    }
-  }
-
   private async fallbackFindCommand(args: any) {
     const { query, command_type = "any", limit = 5 } = args;
     
@@ -719,7 +695,7 @@ class MemexSearchServer {
             query,
             total_found: results.length,
             search_method: "fallback",
-            commands: results.slice(0, limit)
+            results: results.slice(0, limit)
           }, null, 2)
         }
       ]
