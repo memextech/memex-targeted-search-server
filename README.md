@@ -27,7 +27,14 @@ This MCP server enables AI agents to efficiently search through:
 ## Installation
 
 ```bash
+# Clone the repository
+git clone https://github.com/memextech/memex-targeted-search-server.git
+cd memex-targeted-search-server
+
+# Install dependencies
 npm install
+
+# Build the project
 npm run build
 ```
 
@@ -37,58 +44,220 @@ The server is configured to search:
 - **Conversation History**: `~/Library/Application Support/Memex/history/`
 - **Project Files**: `~/Workspace/`
 
+### MCP Server Configuration
+
+Add to your MCP configuration (e.g., Claude Desktop config):
+
+```json
+{
+  "mcpServers": {
+    "memex-search": {
+      "command": "node",
+      "args": ["/path/to/memex-targeted-search-server/dist/index.js"]
+    }
+  }
+}
+```
+
 ## Usage Examples
 
-### Search Conversations
-```typescript
-// Find conversations about 3D modeling
-search_conversations({
-  query: "3D model",
-  limit: 5,
-  date_from: "2025-01-01"
-})
+### 1. Search Conversations
 
-// Find conversations in specific project
+#### Find conversations about specific topics
+```typescript
+search_conversations({
+  query: "3D modeling",
+  limit: 5
+})
+```
+
+**Example Response:**
+```json
+{
+  "total_found": 3,
+  "conversations": [
+    {
+      "conversation_id": "a3edfc8f-0978-415e-9de8-18f4d94ea3a2",
+      "title": "3D Interactive Solar System Model",
+      "summary": "Design an engaging, visually appealing 3D representation of planets and celestial bodies",
+      "created_at": "2025-05-27T17:13:26Z",
+      "project": "Stellar 3d solar system",
+      "message_count": 76,
+      "relevance": "content"
+    }
+  ]
+}
+```
+
+#### Filter by date range and project
+```typescript
 search_conversations({
   query: "python",
   project: "cad_example",
+  date_from: "2025-01-01",
+  date_to: "2025-03-01",
   limit: 3
 })
 ```
 
-### Get Conversation Details
+### 2. Get Conversation Details
+
+#### Retrieve specific messages from a conversation
 ```typescript
-// Get specific messages from a conversation
 get_conversation_snippet({
   conversation_id: "bf283daa-25d3-434f-ad7e-9adda48cdcdd",
   message_start: 1,
-  message_count: 5
+  message_count: 3
 })
 ```
 
-### Search Projects
+**Example Response:**
+```json
+{
+  "conversation_id": "bf283daa-25d3-434f-ad7e-9adda48cdcdd",
+  "title": "3D Model 3MF File Creation",
+  "message_range": "1-3",
+  "total_messages": 30,
+  "messages": [
+    {
+      "index": 1,
+      "role": "user",
+      "content": "can I create a 3D model in .3mf?"
+    },
+    {
+      "index": 2,
+      "role": "assistant",
+      "content": "I'll help you create a 3D model using PythonOCC and convert it to .3mf format..."
+    }
+  ]
+}
+```
+
+### 3. Search Projects
+
+#### Find files by technology
 ```typescript
-// Find TypeScript files
 search_projects({
   query: "interface",
   file_types: ["ts", "js"],
   limit: 10
 })
+```
 
-// Search all project files
+#### Search all project files
+```typescript
 search_projects({
   query: "streamlit",
   limit: 5
 })
 ```
 
-### Get Project Overview
+**Example Response:**
+```json
+{
+  "total_found": 3,
+  "results": [
+    {
+      "project": "ad_campaign_dashboard",
+      "file": "ad_campaign_dashboard/app.py",
+      "match": "import streamlit as st",
+      "line": 1
+    }
+  ]
+}
+```
+
+### 4. Get Project Overview
+
+#### Analyze project structure and tech stack
 ```typescript
-// Analyze project structure and tech stack
 get_project_overview({
   project_name: "memex_targeted_search_server"
 })
 ```
+
+**Example Response:**
+```json
+{
+  "name": "memex_targeted_search_server",
+  "path": "/Users/user/Workspace/memex_targeted_search_server",
+  "file_count": 8,
+  "directories": ["dist", "src"],
+  "file_types": {
+    "ts": 1,
+    "js": 1,
+    "json": 3,
+    "md": 1
+  },
+  "main_files": ["package.json", "README.md"],
+  "technologies": ["JavaScript/TypeScript"]
+}
+```
+
+## Real-World Usage Scenarios
+
+### Scenario 1: Finding Related Work
+```typescript
+// Agent: "I need to find previous conversations about Blender projects"
+search_conversations({
+  query: "blender",
+  limit: 5
+})
+
+// Result: Finds 2 conversations about 3D Manhattan cityscape and geometric skyscraper
+// Agent can then drill down into specific conversations for details
+```
+
+### Scenario 2: Code Reference Lookup
+```typescript
+// Agent: "Show me Python projects that use Streamlit"
+search_projects({
+  query: "streamlit",
+  file_types: ["py"],
+  limit: 10
+})
+
+// Result: Finds specific Python files with Streamlit imports
+// Agent can then examine project structure and implementation patterns
+```
+
+### Scenario 3: Cross-Reference Discovery
+```typescript
+// Agent: "Find conversations from January 2025 about 3D modeling"
+search_conversations({
+  query: "3D model",
+  date_from: "2025-01-01",
+  date_to: "2025-01-31",
+  limit: 5
+})
+
+// Agent: "Now show me the related project files"
+get_project_overview({
+  project_name: "cad_example"
+})
+```
+
+## API Reference
+
+### search_conversations
+- **Purpose**: Search conversation history with flexible filtering
+- **Parameters**: `query` (required), `limit`, `project`, `date_from`, `date_to`
+- **Returns**: Array of conversation metadata with relevance scoring
+
+### get_conversation_snippet  
+- **Purpose**: Retrieve specific message ranges from conversations
+- **Parameters**: `conversation_id` (required), `message_start`, `message_count`
+- **Returns**: Conversation snippet with message details
+
+### search_projects
+- **Purpose**: Search project files by content and metadata
+- **Parameters**: `query` (required), `file_types`, `limit`
+- **Returns**: Array of file matches with context
+
+### get_project_overview
+- **Purpose**: Analyze project structure and technology stack
+- **Parameters**: `project_name` (required)
+- **Returns**: Project summary with file counts and tech detection
 
 ## Architecture
 
@@ -114,7 +283,35 @@ The server is designed for optimal agent interaction:
 - **Progressive Discovery**: Start with summaries, drill down to details
 - **Context Preservation**: Maintain conversation and project relationships
 
+## Development
+
+### Running in Development
+```bash
+npm run dev
+```
+
+### Building for Production
+```bash
+npm run build
+npm start
+```
+
+### Testing
+The server includes comprehensive error handling and graceful degradation for:
+- Missing or corrupted conversation files
+- Inaccessible project directories
+- Invalid JSON parsing
+- Large file handling
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+ISC License
+
 ---
 
-🤖 Generated with [Memex](https://memex.tech)
+🤖 Generated with [Memex](https://memex.tech)  
 Co-Authored-By: Memex <noreply@memex.tech>
