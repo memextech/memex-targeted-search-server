@@ -12,13 +12,21 @@
     "dev": "tsx src/index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["mcp", "memex", "search", "ai"],
+  "keywords": [
+    "mcp",
+    "memex",
+    "search",
+    "ai"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.2",
     "@types/node": "^24.0.7",
+    "@types/sqlite3": "^3.1.11",
+    "fuse.js": "^7.1.0",
+    "sqlite3": "^5.1.7",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   }

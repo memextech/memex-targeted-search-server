@@ -41,12 +41,14 @@ const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const child_process_1 = require("child_process");
 const util_1 = require("util");
+const SearchIndex_js_1 = require("./SearchIndex.js");
 const execAsync = (0, util_1.promisify)(child_process_1.exec);
 // Configuration
 const MEMEX_HISTORY_PATH = path.join(process.env.HOME, "Library", "Application Support", "Memex", "history");
 const WORKSPACE_PATH = path.join(process.env.HOME, "Workspace");
 class MemexSearchServer {
     server;
+    searchIndex;
     constructor() {
         this.server = new index_js_1.Server({
             name: "memex-search-server",
@@ -56,6 +58,7 @@ class MemexSearchServer {
                 tools: {},
             },
         });
+        this.searchIndex = new SearchIndex_js_1.SearchIndex();
         this.setupToolHandlers();
     }
     setupToolHandlers() {
@@ -180,6 +183,24 @@ class MemexSearchServer {
                             },
                             required: ["query"]
                         }
+                    },
+                    {
+                        name: "build_search_index",
+                        description: "Build or rebuild the search index for better performance",
+                        inputSchema: {
+                            type: "object",
+                            properties: {},
+                            required: []
+                        }
+                    },
+                    {
+                        name: "get_search_stats",
+                        description: "Get statistics about the search index",
+                        inputSchema: {
+                            type: "object",
+                            properties: {},
+                            required: []
+                        }
                     }
                 ]
             };
@@ -199,6 +220,10 @@ class MemexSearchServer {
                         return await this.getProjectOverview(args);
                     case "find_command":
                         return await this.findCommand(args);
+                    case "build_search_index":
+                        return await this.buildSearchIndex(args);
+                    case "get_search_stats":
+                        return await this.getSearchStats(args);
                     default:
                         throw new Error(`Unknown tool: ${name}`);
                 }
@@ -218,104 +243,111 @@ class MemexSearchServer {
     async searchConversations(args) {
         const { query, limit = 10, project, date_from, date_to } = args;
         try {
-            // Get all conversation files
-            const files = await fs.promises.readdir(MEMEX_HISTORY_PATH);
-            const jsonFiles = files.filter(f => f.endsWith('.json'));
-            const results = [];
-            for (const file of jsonFiles.slice(0, 100)) { // Limit to prevent overwhelming
-                try {
-                    const filePath = path.join(MEMEX_HISTORY_PATH, file);
-                    const content = await fs.promises.readFile(filePath, 'utf-8');
-                    const data = JSON.parse(content);
-                    // Apply filters
-                    if (project && data.metadata?.project !== project)
-                        continue;
-                    if (date_from || date_to) {
-                        const createdAt = new Date(data.metadata?.created_at);
-                        if (date_from && createdAt < new Date(date_from))
-                            continue;
-                        if (date_to && createdAt > new Date(date_to))
-                            continue;
-                    }
-                    // Enhanced matching with multiple strategies
-                    const title = data.title || '';
-                    const summary = data.summary || '';
-                    const queryLower = query.toLowerCase();
-                    const queryTerms = query.split(/\s+/).filter((term) => term.length > 2);
-                    let relevance = '';
-                    let matches = false;
-                    let confidence = 0;
-                    // Check title match
-                    if (this.smartMatch(title.toLowerCase(), queryLower, queryTerms)) {
-                        relevance = 'title';
-                        matches = true;
-                        confidence = 0.9;
-                    }
-                    // Check summary match
-                    else if (this.smartMatch(summary.toLowerCase(), queryLower, queryTerms)) {
-                        relevance = 'summary';
-                        matches = true;
-                        confidence = 0.8;
-                    }
-                    // Check content match with better algorithm
-                    else {
-                        const messages = data.messages || [];
-                        let bestMatchConfidence = 0;
-                        for (let i = 0; i < Math.min(messages.length, 10); i++) {
-                            const content = messages[i].content || '';
-                            const contentLower = content.toLowerCase();
-                            if (this.smartMatch(contentLower, queryLower, queryTerms)) {
-                                const messageConfidence = this.calculateMessageConfidence(content, query);
-                                if (messageConfidence > bestMatchConfidence) {
-                                    bestMatchConfidence = messageConfidence;
-                                    relevance = `content (message ${i})`;
-                                    matches = true;
-                                    confidence = messageConfidence;
-                                }
-                            }
+            // Try to use indexed search first
+            try {
+                const results = await this.searchIndex.searchConversations(query, {
+                    project,
+                    dateFrom: date_from,
+                    dateTo: date_to,
+                    limit
+                });
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify({
+                                total_found: results.length,
+                                search_method: "indexed",
+                                conversations: results.map(r => {
+                                    const item = r.item; // Type assertion for now
+                                    return {
+                                        conversation_id: item.conversation_id,
+                                        title: item.title,
+                                        summary: item.summary,
+                                        created_at: item.created_at,
+                                        project: item.project,
+                                        message_count: item.message_count,
+                                        relevance: `indexed search (score: ${r.score.toFixed(2)})`,
+                                        file: item.file_path
+                                    };
+                                })
+                            }, null, 2)
                         }
-                    }
-                    if (matches) {
-                        results.push({
-                            title,
-                            summary,
-                            metadata: data.metadata,
-                            filePath: file,
-                            relevance: `${relevance} (confidence: ${confidence.toFixed(2)})`
-                        });
-                    }
-                    if (results.length >= limit)
-                        break;
-                }
-                catch (error) {
-                    // Skip files that can't be parsed
-                    continue;
-                }
+                    ]
+                };
             }
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            total_found: results.length,
-                            conversations: results.map(r => ({
-                                conversation_id: r.metadata.conversation_id,
-                                title: r.title,
-                                summary: r.summary,
-                                created_at: r.metadata.created_at,
-                                project: r.metadata.project,
-                                message_count: (r.metadata.user_turn_count || 0) + (r.metadata.assistant_turn_count || 0),
-                                relevance: r.relevance,
-                                file: r.filePath
-                            }))
-                        }, null, 2)
-                    }
-                ]
-            };
+            catch (indexError) {
+                // Fall back to original search method
+                return await this.fallbackSearchConversations(args);
+            }
         }
         catch (error) {
             throw new Error(`Failed to search conversations: ${error}`);
         }
+    }
+    async fallbackSearchConversations(args) {
+        const { query, limit = 10, project, date_from, date_to } = args;
+        // Original implementation as fallback
+        const files = await fs.promises.readdir(MEMEX_HISTORY_PATH);
+        const jsonFiles = files.filter(f => f.endsWith('.json'));
+        const results = [];
+        for (const file of jsonFiles.slice(0, 50)) { // Limit for fallback
+            try {
+                const filePath = path.join(MEMEX_HISTORY_PATH, file);
+                const content = await fs.promises.readFile(filePath, 'utf-8');
+                const data = JSON.parse(content);
+                // Apply filters
+                if (project && data.metadata?.project !== project)
+                    continue;
+                if (date_from || date_to) {
+                    const createdAt = new Date(data.metadata?.created_at);
+                    if (date_from && createdAt < new Date(date_from))
+                        continue;
+                    if (date_to && createdAt > new Date(date_to))
+                        continue;
+                }
+                // Simple search for fallback
+                const title = data.title || '';
+                const summary = data.summary || '';
+                const queryLower = query.toLowerCase();
+                if (title.toLowerCase().includes(queryLower) ||
+                    summary.toLowerCase().includes(queryLower)) {
+                    results.push({
+                        title,
+                        summary,
+                        metadata: data.metadata,
+                        filePath: file,
+                        relevance: "fallback search"
+                    });
+                }
+                if (results.length >= limit)
+                    break;
+            }
+            catch (error) {
+                continue;
+            }
+        }
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify({
+                        total_found: results.length,
+                        search_method: "fallback",
+                        conversations: results.map(r => ({
+                            conversation_id: r.metadata.conversation_id,
+                            title: r.title,
+                            summary: r.summary,
+                            created_at: r.metadata.created_at,
+                            project: r.metadata.project,
+                            message_count: (r.metadata.user_turn_count || 0) + (r.metadata.assistant_turn_count || 0),
+                            relevance: r.relevance,
+                            file: r.filePath
+                        }))
+                    }, null, 2)
+                }
+            ]
+        };
     }
     async getConversationSnippet(args) {
         const { conversation_id, message_start = 0, message_count = 10 } = args;
@@ -536,76 +568,105 @@ class MemexSearchServer {
     async findCommand(args) {
         const { query, command_type = "any", limit = 5 } = args;
         try {
-            const results = [];
-            // Get all conversation files
-            const files = await fs.promises.readdir(MEMEX_HISTORY_PATH);
-            const jsonFiles = files.filter(f => f.endsWith('.json'));
-            for (const file of jsonFiles.slice(0, 20)) { // Limit files to search for debugging
-                try {
-                    const filePath = path.join(MEMEX_HISTORY_PATH, file);
-                    const content = await fs.promises.readFile(filePath, 'utf-8');
-                    const data = JSON.parse(content);
-                    const messages = data.messages || [];
-                    for (let i = 0; i < messages.length; i++) {
-                        const message = messages[i];
-                        if (!message.content)
-                            continue;
-                        // Simple backtick command extraction for debugging
-                        const content = message.content;
-                        const backtickMatches = content.match(/`([^`]+)`/g);
-                        if (backtickMatches) {
-                            for (const match of backtickMatches) {
-                                const command = match.slice(1, -1); // Remove backticks
-                                const commandLower = command.toLowerCase();
-                                const queryLower = query.toLowerCase();
-                                // Check if command contains query terms
-                                if (commandLower.includes(queryLower) || queryLower.split(/\s+/).some((term) => commandLower.includes(term))) {
-                                    let confidence = 0.8;
-                                    // Boost for exact match
-                                    if (commandLower.includes(queryLower)) {
-                                        confidence += 0.1;
-                                    }
-                                    results.push({
-                                        command: command,
-                                        context: this.getContextAround(content.split('\n'), 0, 2),
-                                        conversation_id: data.metadata?.conversation_id || '',
-                                        conversation_title: data.title || '',
-                                        message_index: i,
-                                        confidence: confidence,
-                                        type: 'cli'
-                                    });
-                                }
-                            }
+            // Try indexed search first
+            try {
+                const results = await this.searchIndex.searchCommands(query, {
+                    commandType: command_type,
+                    limit
+                });
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify({
+                                query,
+                                total_found: results.length,
+                                search_method: "indexed",
+                                commands: results.map(r => {
+                                    const item = r.item; // Type assertion for now
+                                    return {
+                                        command: item.command,
+                                        context: item.context,
+                                        conversation_id: item.conversation_id,
+                                        conversation_title: `Message ${item.message_index}`,
+                                        message_index: item.message_index,
+                                        confidence: item.confidence,
+                                        type: item.command_type,
+                                        search_score: r.score
+                                    };
+                                })
+                            }, null, 2)
                         }
-                    }
-                    if (results.length >= limit * 3)
-                        break; // Get more than needed for sorting
-                }
-                catch (error) {
-                    continue; // Skip files that can't be parsed
-                }
+                    ]
+                };
             }
-            // Sort by confidence and take top results
-            const sortedResults = results
-                .sort((a, b) => b.confidence - a.confidence)
-                .slice(0, limit);
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            query,
-                            total_found: sortedResults.length,
-                            commands: sortedResults,
-                            debug: `Searched ${jsonFiles.slice(0, 20).length} files`
-                        }, null, 2)
-                    }
-                ]
-            };
+            catch (indexError) {
+                // Fall back to original method
+                return await this.fallbackFindCommand(args);
+            }
         }
         catch (error) {
             throw new Error(`Failed to find commands: ${error}`);
         }
+    }
+    async fallbackFindCommand(args) {
+        const { query, command_type = "any", limit = 5 } = args;
+        const results = [];
+        // Simplified fallback implementation
+        const files = await fs.promises.readdir(MEMEX_HISTORY_PATH);
+        const jsonFiles = files.filter(f => f.endsWith('.json'));
+        for (const file of jsonFiles.slice(0, 10)) {
+            try {
+                const filePath = path.join(MEMEX_HISTORY_PATH, file);
+                const content = await fs.promises.readFile(filePath, 'utf-8');
+                const data = JSON.parse(content);
+                const messages = data.messages || [];
+                for (let i = 0; i < messages.length; i++) {
+                    const message = messages[i];
+                    if (!message.content)
+                        continue;
+                    const backtickMatches = message.content.match(/`([^`]+)`/g);
+                    if (backtickMatches) {
+                        for (const match of backtickMatches) {
+                            const command = match.slice(1, -1);
+                            const commandLower = command.toLowerCase();
+                            const queryLower = query.toLowerCase();
+                            if (commandLower.includes(queryLower)) {
+                                results.push({
+                                    command: command,
+                                    context: this.getContextAround(message.content.split('\n'), 0, 1),
+                                    conversation_id: data.metadata?.conversation_id || '',
+                                    conversation_title: data.title || '',
+                                    message_index: i,
+                                    confidence: 0.8,
+                                    type: 'cli'
+                                });
+                            }
+                        }
+                    }
+                    if (results.length >= limit)
+                        break;
+                }
+                if (results.length >= limit)
+                    break;
+            }
+            catch (error) {
+                continue;
+            }
+        }
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify({
+                        query,
+                        total_found: results.length,
+                        search_method: "fallback",
+                        commands: results.slice(0, limit)
+                    }, null, 2)
+                }
+            ]
+        };
     }
     extractCommands(content, query, commandType) {
         const commands = [];
@@ -814,6 +875,49 @@ class MemexSearchServer {
             /terminal|command|cli|shell/i,
         ];
         return cliPatterns.some(pattern => pattern.test(content));
+    }
+    async buildSearchIndex(args) {
+        try {
+            await this.searchIndex.buildIndex(MEMEX_HISTORY_PATH);
+            const stats = await this.searchIndex.getStats();
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({
+                            status: "success",
+                            message: "Search index built successfully",
+                            stats
+                        }, null, 2)
+                    }
+                ]
+            };
+        }
+        catch (error) {
+            throw new Error(`Failed to build search index: ${error}`);
+        }
+    }
+    async getSearchStats(args) {
+        try {
+            const stats = await this.searchIndex.getStats();
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({
+                            search_index_stats: stats,
+                            paths: {
+                                conversations: MEMEX_HISTORY_PATH,
+                                projects: WORKSPACE_PATH
+                            }
+                        }, null, 2)
+                    }
+                ]
+            };
+        }
+        catch (error) {
+            throw new Error(`Failed to get search stats: ${error}`);
+        }
     }
     async run() {
         const transport = new stdio_js_1.StdioServerTransport();
