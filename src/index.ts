@@ -42,6 +42,16 @@ interface ConversationData extends ConversationMetadata {
   messages: ConversationMessage[];
 }
 
+interface CommandMatch {
+  command: string;
+  context: string;
+  conversation_id: string;
+  conversation_title: string;
+  message_index: number;
+  confidence: number;
+  type: 'cli' | 'code' | 'config';
+}
+
 class MemexSearchServer {
   private server: Server;
 
@@ -158,6 +168,31 @@ class MemexSearchServer {
               },
               required: ["project_name"]
             }
+          },
+          {
+            name: "find_command",
+            description: "Find specific commands, CLI usage, or code snippets from conversation history",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: {
+                  type: "string",
+                  description: "Search for specific commands (e.g. 'memex agent cli', 'npm install', 'git commit')"
+                },
+                command_type: {
+                  type: "string",
+                  enum: ["cli", "code", "config", "any"],
+                  description: "Type of command to search for (default: any)",
+                  default: "any"
+                },
+                limit: {
+                  type: "number",
+                  description: "Maximum number of results to return (default: 5)",
+                  default: 5
+                }
+              },
+              required: ["query"]
+            }
           }
         ] satisfies Tool[]
       };
@@ -177,6 +212,8 @@ class MemexSearchServer {
             return await this.searchProjects(args);
           case "get_project_overview":
             return await this.getProjectOverview(args);
+          case "find_command":
+            return await this.findCommand(args);
           default:
             throw new Error(`Unknown tool: ${name}`);
         }
@@ -218,28 +255,45 @@ class MemexSearchServer {
             if (date_to && createdAt > new Date(date_to)) continue;
           }
           
-          // Check if query matches
+          // Enhanced matching with multiple strategies
           const title = data.title || '';
           const summary = data.summary || '';
           const queryLower = query.toLowerCase();
+          const queryTerms = query.split(/\s+/).filter((term: string) => term.length > 2);
           
           let relevance = '';
           let matches = false;
+          let confidence = 0;
           
-          if (title.toLowerCase().includes(queryLower)) {
+          // Check title match
+          if (this.smartMatch(title.toLowerCase(), queryLower, queryTerms)) {
             relevance = 'title';
             matches = true;
-          } else if (summary.toLowerCase().includes(queryLower)) {
+            confidence = 0.9;
+          } 
+          // Check summary match
+          else if (this.smartMatch(summary.toLowerCase(), queryLower, queryTerms)) {
             relevance = 'summary';
             matches = true;
-          } else {
-            // Check first few messages for content match
+            confidence = 0.8;
+          } 
+          // Check content match with better algorithm
+          else {
             const messages = data.messages || [];
-            for (let i = 0; i < Math.min(messages.length, 5); i++) {
-              if (messages[i].content?.toLowerCase().includes(queryLower)) {
-                relevance = 'content';
-                matches = true;
-                break;
+            let bestMatchConfidence = 0;
+            
+            for (let i = 0; i < Math.min(messages.length, 10); i++) {
+              const content = messages[i].content || '';
+              const contentLower = content.toLowerCase();
+              
+              if (this.smartMatch(contentLower, queryLower, queryTerms)) {
+                const messageConfidence = this.calculateMessageConfidence(content, query);
+                if (messageConfidence > bestMatchConfidence) {
+                  bestMatchConfidence = messageConfidence;
+                  relevance = `content (message ${i})`;
+                  matches = true;
+                  confidence = messageConfidence;
+                }
               }
             }
           }
@@ -250,7 +304,7 @@ class MemexSearchServer {
               summary,
               metadata: data.metadata,
               filePath: file,
-              relevance
+              relevance: `${relevance} (confidence: ${confidence.toFixed(2)})`
             });
           }
           
@@ -531,6 +585,342 @@ class MemexSearchServer {
     }
     
     return analysis;
+  }
+
+  private async findCommand(args: any) {
+    const { query, command_type = "any", limit = 5 } = args;
+    
+    try {
+      const results: CommandMatch[] = [];
+      
+      // Get all conversation files
+      const files = await fs.promises.readdir(MEMEX_HISTORY_PATH);
+      const jsonFiles = files.filter(f => f.endsWith('.json'));
+      
+      for (const file of jsonFiles.slice(0, 20)) { // Limit files to search for debugging
+        try {
+          const filePath = path.join(MEMEX_HISTORY_PATH, file);
+          const content = await fs.promises.readFile(filePath, 'utf-8');
+          const data = JSON.parse(content);
+          
+          const messages = data.messages || [];
+          for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
+            if (!message.content) continue;
+            
+            // Simple backtick command extraction for debugging
+            const content = message.content;
+            const backtickMatches = content.match(/`([^`]+)`/g);
+            
+            if (backtickMatches) {
+              for (const match of backtickMatches) {
+                const command = match.slice(1, -1); // Remove backticks
+                const commandLower = command.toLowerCase();
+                const queryLower = query.toLowerCase();
+                
+                // Check if command contains query terms
+                if (commandLower.includes(queryLower) || queryLower.split(/\s+/).some((term: string) => commandLower.includes(term))) {
+                  let confidence = 0.8;
+                  
+                  // Boost for exact match
+                  if (commandLower.includes(queryLower)) {
+                    confidence += 0.1;
+                  }
+                  
+                  results.push({
+                    command: command,
+                    context: this.getContextAround(content.split('\n'), 0, 2),
+                    conversation_id: data.metadata?.conversation_id || '',
+                    conversation_title: data.title || '',
+                    message_index: i,
+                    confidence: confidence,
+                    type: 'cli'
+                  });
+                }
+              }
+            }
+          }
+          
+          if (results.length >= limit * 3) break; // Get more than needed for sorting
+        } catch (error) {
+          continue; // Skip files that can't be parsed
+        }
+      }
+      
+      // Sort by confidence and take top results
+      const sortedResults = results
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, limit);
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              query,
+              total_found: sortedResults.length,
+              commands: sortedResults,
+              debug: `Searched ${jsonFiles.slice(0, 20).length} files`
+            }, null, 2)
+          }
+        ]
+      };
+    } catch (error) {
+      throw new Error(`Failed to find commands: ${error}`);
+    }
+  }
+
+  private extractCommands(content: string, query: string, commandType: string): Array<{command: string, context: string, confidence: number, type: 'cli' | 'code' | 'config'}> {
+    const commands: Array<{command: string, context: string, confidence: number, type: 'cli' | 'code' | 'config'}> = [];
+    const lines = content.split('\n');
+    const queryLower = query.toLowerCase();
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const lineLower = line.toLowerCase();
+      
+      // More permissive matching - if line contains any query term OR has command patterns
+      const hasQueryTerm = queryLower.split(/\s+/).some((term: string) => lineLower.includes(term));
+      const hasCommandPattern = this.hasCommandPatterns(line);
+      
+      if (!hasQueryTerm && !hasCommandPattern) continue;
+      
+      // Extract different types of commands
+      const cliCommands = this.extractCliCommands(line, queryLower);
+      const codeCommands = this.extractCodeCommands(line, queryLower);
+      const configCommands = this.extractConfigCommands(line, queryLower);
+      
+      // Add commands based on type filter
+      if (commandType === "any" || commandType === "cli") {
+        commands.push(...cliCommands.map(cmd => ({
+          ...cmd,
+          context: this.getContextAround(lines, i, 2),
+          type: 'cli' as const
+        })));
+      }
+      
+      if (commandType === "any" || commandType === "code") {
+        commands.push(...codeCommands.map(cmd => ({
+          ...cmd,
+          context: this.getContextAround(lines, i, 2),
+          type: 'code' as const
+        })));
+      }
+      
+      if (commandType === "any" || commandType === "config") {
+        commands.push(...configCommands.map(cmd => ({
+          ...cmd,
+          context: this.getContextAround(lines, i, 2),
+          type: 'config' as const
+        })));
+      }
+    }
+    
+    return commands;
+  }
+
+  private containsQueryTerms(text: string, query: string): boolean {
+    const queryTerms = query.split(/\s+/).filter((term: string) => term.length > 2);
+    return queryTerms.some((term: string) => text.includes(term));
+  }
+
+  private extractCliCommands(line: string, query: string): Array<{command: string, confidence: number}> {
+    const commands: Array<{command: string, confidence: number}> = [];
+    
+    // Simple but effective patterns
+    const patterns = [
+      // Backtick commands (most reliable)
+      { regex: /`([^`]+)`/g, confidence: 0.9 },
+      // Commands with $ prefix
+      { regex: /\$\s*([^\n\r]+)/g, confidence: 0.8 },
+      // npm/yarn commands
+      { regex: /(npm|yarn|pnpm)\s+([^\s\n]+(?:\s+[^\s\n]+)*)/gi, confidence: 0.7 },
+      // git commands
+      { regex: /(git)\s+([^\s\n]+(?:\s+[^\s\n]+)*)/gi, confidence: 0.7 },
+      // firebase commands
+      { regex: /(firebase)\s+([^\s\n]+(?:\s+[^\s\n]+)*)/gi, confidence: 0.7 },
+      // memex commands
+      { regex: /(memex)\s+([^\s\n]+(?:\s+[^\s\n]+)*)/gi, confidence: 0.8 },
+    ];
+    
+    for (const { regex, confidence: baseConfidence } of patterns) {
+      const matches = Array.from(line.matchAll(regex));
+      for (const match of matches) {
+        let command = match[1];
+        if (match[2]) {
+          command = `${match[1]} ${match[2]}`;
+        }
+        
+        let confidence = baseConfidence;
+        
+        // Boost confidence if query terms match
+        const commandLower = command.toLowerCase();
+        const queryTerms = query.split(/\s+/);
+        
+        for (const term of queryTerms) {
+          if (commandLower.includes(term)) {
+            confidence += 0.1;
+          }
+        }
+        
+        commands.push({
+          command: command.trim(),
+          confidence: Math.min(confidence, 1.0)
+        });
+      }
+    }
+    
+    return commands;
+  }
+
+  private extractCodeCommands(line: string, query: string): Array<{command: string, confidence: number}> {
+    const commands: Array<{command: string, confidence: number}> = [];
+    
+    // Code patterns (function calls, imports, etc.)
+    const codePatterns = [
+      /import\s+.+from\s+['"`](.+)['"`]/i,  // imports
+      /require\(['"`](.+)['"`]\)/i,         // requires
+      /(\w+\.\w+\([^)]*\))/g,               // method calls
+      /new\s+(\w+)/i,                       // constructors
+      /class\s+(\w+)/i,                     // class definitions
+      /function\s+(\w+)/i,                  // function definitions
+      /const\s+(\w+)\s*=/i,                 // const declarations
+    ];
+    
+    for (const pattern of codePatterns) {
+      const matches = line.matchAll(new RegExp(pattern.source, pattern.flags));
+      for (const match of matches) {
+        const command = match[1] || match[0];
+        let confidence = 0.5;
+        
+        const commandLower = command.toLowerCase();
+        const queryTerms = query.split(/\s+/);
+        
+        for (const term of queryTerms) {
+          if (commandLower.includes(term)) {
+            confidence += 0.15;
+          }
+        }
+        
+        commands.push({
+          command: command.trim(),
+          confidence: Math.min(confidence, 1.0)
+        });
+      }
+    }
+    
+    return commands;
+  }
+
+  private extractConfigCommands(line: string, query: string): Array<{command: string, confidence: number}> {
+    const commands: Array<{command: string, confidence: number}> = [];
+    
+    // Configuration patterns
+    const configPatterns = [
+      /["']([^"']*(?:config|setting|option)[^"']*)["']/i,  // config strings
+      /(\w+):\s*(.+)/,                                     // key: value pairs
+      /--(\w+(?:-\w+)*)/g,                                 // command line flags
+      /-(\w)/g,                                            // short flags
+    ];
+    
+    for (const pattern of configPatterns) {
+      const matches = line.matchAll(new RegExp(pattern.source, pattern.flags));
+      for (const match of matches) {
+        const command = match[1] || match[0];
+        let confidence = 0.4;
+        
+        const commandLower = command.toLowerCase();
+        const queryTerms = query.split(/\s+/);
+        
+        for (const term of queryTerms) {
+          if (commandLower.includes(term)) {
+            confidence += 0.1;
+          }
+        }
+        
+        commands.push({
+          command: command.trim(),
+          confidence: Math.min(confidence, 1.0)
+        });
+      }
+    }
+    
+    return commands;
+  }
+
+  private getContextAround(lines: string[], lineIndex: number, contextLines: number): string {
+    const start = Math.max(0, lineIndex - contextLines);
+    const end = Math.min(lines.length, lineIndex + contextLines + 1);
+    return lines.slice(start, end).join('\n').trim();
+  }
+
+  private smartMatch(text: string, query: string, queryTerms: string[]): boolean {
+    // Direct match
+    if (text.includes(query)) return true;
+    
+    // Fuzzy term matching - all terms must be present
+    const requiredTerms = queryTerms.filter((term: string) => term.length > 2);
+    const foundTerms = requiredTerms.filter((term: string) => text.includes(term));
+    
+    // Require at least 80% of terms to match
+    return foundTerms.length >= Math.ceil(requiredTerms.length * 0.8);
+  }
+
+  private calculateMessageConfidence(content: string, query: string): number {
+    const contentLower = content.toLowerCase();
+    const queryLower = query.toLowerCase();
+    let confidence = 0.3;
+    
+    // Boost for exact query match
+    if (contentLower.includes(queryLower)) {
+      confidence += 0.4;
+    }
+    
+    // Boost for command patterns
+    if (this.hasCommandPatterns(content)) {
+      confidence += 0.2;
+    }
+    
+    // Boost for memex-related content
+    if (contentLower.includes('memex')) {
+      confidence += 0.1;
+    }
+    
+    // Boost for CLI patterns
+    if (this.hasCLIPatterns(content)) {
+      confidence += 0.15;
+    }
+    
+    // Boost for code blocks
+    if (content.includes('```') || content.includes('`')) {
+      confidence += 0.1;
+    }
+    
+    return Math.min(confidence, 1.0);
+  }
+
+  private hasCommandPatterns(content: string): boolean {
+    const commandPatterns = [
+      /\$\s+\w+/,          // $ command
+      /npm\s+\w+/i,        // npm commands
+      /git\s+\w+/i,        // git commands
+      /python\s+\w+/i,     // python commands
+      /node\s+\w+/i,       // node commands
+      /--\w+/,             // command flags
+    ];
+    
+    return commandPatterns.some(pattern => pattern.test(content));
+  }
+
+  private hasCLIPatterns(content: string): boolean {
+    const cliPatterns = [
+      /^\s*\$\s+/m,        // $ prefix
+      /^\s*>\s+/m,         // > prefix
+      /^\s*#\s+/m,         // # prefix
+      /terminal|command|cli|shell/i,
+    ];
+    
+    return cliPatterns.some(pattern => pattern.test(content));
   }
 
   async run() {
