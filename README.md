@@ -16,6 +16,7 @@ This MCP server enables AI agents to efficiently search through:
 2. **`get_conversation_snippet`** - Retrieve specific parts of conversations without context overload
 3. **`search_projects`** - Search project files by content, file types, and names
 4. **`get_project_overview`** - Get project summaries with technology detection
+5. **`find_command`** - **NEW!** Find specific commands, CLI usage, or code snippets from conversation history
 
 ### 🎯 Smart Context Management
 
@@ -61,7 +62,46 @@ Add to your MCP configuration (e.g., Claude Desktop config):
 
 ## Usage Examples
 
-### 1. Search Conversations
+### 1. Find Forgotten Commands
+
+#### "I don't remember what the command is to run the memex agent cli"
+```typescript
+find_command({
+  query: "memex agent cli",
+  command_type: "cli",
+  limit: 5
+})
+```
+
+#### Find specific npm commands
+```typescript
+find_command({
+  query: "npm install",
+  command_type: "cli",
+  limit: 5
+})
+```
+
+**Example Response:**
+```json
+{
+  "query": "npm install",
+  "total_found": 3,
+  "commands": [
+    {
+      "command": "npm install -g firebase-tools",
+      "context": "Install Firebase CLI: `npm install -g firebase-tools`\n- Login to Firebase: `firebase login`",
+      "conversation_id": "abc123",
+      "conversation_title": "Firebase Setup Guide",
+      "message_index": 7,
+      "confidence": 0.9,
+      "type": "cli"
+    }
+  ]
+}
+```
+
+### 2. Search Conversations
 
 #### Find conversations about specific topics
 ```typescript
@@ -100,7 +140,7 @@ search_conversations({
 })
 ```
 
-### 2. Get Conversation Details
+### 3. Get Conversation Details
 
 #### Retrieve specific messages from a conversation
 ```typescript
@@ -133,7 +173,7 @@ get_conversation_snippet({
 }
 ```
 
-### 3. Search Projects
+### 4. Search Projects
 
 #### Find files by technology
 ```typescript
@@ -167,7 +207,7 @@ search_projects({
 }
 ```
 
-### 4. Get Project Overview
+### 5. Get Project Overview
 
 #### Analyze project structure and tech stack
 ```typescript
@@ -196,7 +236,26 @@ get_project_overview({
 
 ## Real-World Usage Scenarios
 
-### Scenario 1: Finding Related Work
+### Scenario 1: "I forgot that command..."
+```typescript
+// User: "I don't remember what the command is to run the memex agent cli"
+find_command({
+  query: "memex agent",
+  command_type: "cli",
+  limit: 5
+})
+
+// User: "What was that firebase command to deploy?"
+find_command({
+  query: "firebase deploy",
+  command_type: "cli",
+  limit: 3
+})
+
+// Result: Finds exact commands with context from previous conversations
+```
+
+### Scenario 2: Finding Related Work
 ```typescript
 // Agent: "I need to find previous conversations about Blender projects"
 search_conversations({
@@ -208,7 +267,7 @@ search_conversations({
 // Agent can then drill down into specific conversations for details
 ```
 
-### Scenario 2: Code Reference Lookup
+### Scenario 3: Code Reference Lookup
 ```typescript
 // Agent: "Show me Python projects that use Streamlit"
 search_projects({
@@ -221,7 +280,7 @@ search_projects({
 // Agent can then examine project structure and implementation patterns
 ```
 
-### Scenario 3: Cross-Reference Discovery
+### Scenario 4: Cross-Reference Discovery
 ```typescript
 // Agent: "Find conversations from January 2025 about 3D modeling"
 search_conversations({
@@ -258,6 +317,11 @@ get_project_overview({
 - **Purpose**: Analyze project structure and technology stack
 - **Parameters**: `project_name` (required)
 - **Returns**: Project summary with file counts and tech detection
+
+### find_command
+- **Purpose**: Find specific commands, CLI usage, or code snippets from conversation history
+- **Parameters**: `query` (required), `command_type` (cli/code/config/any), `limit`
+- **Returns**: Array of commands with context, confidence scoring, and conversation references
 
 ## Architecture
 
